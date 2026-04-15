@@ -1,19 +1,23 @@
+diff --git a/R/twas_weights.R b/R/twas_weights.R
+index ca59bab..13f5636 100644
 --- a/R/twas_weights.R
 +++ b/R/twas_weights.R
-@@ -429,6 +429,7 @@
- #' # Example usage (assuming appropriate objects for X, y, and susie_fit are available):
- #' twas_results <- twas_weights_pipeline(X, y, susie_fit)
- twas_weights_pipeline <- function(X,
-+                                  ensemble = FALSE,
-                                   y,
-                                   susie_fit = NULL,
-                                   cv_folds = 5,
-@@ -507,6 +508,14 @@
+@@ -444,7 +444,8 @@ twas_weights_pipeline <- function(X,
+                                   ),
+                                   max_cv_variants = -1,
+                                   cv_threads = 1,
+-                                  cv_weight_methods = NULL) {
++                                  cv_weight_methods = NULL,
++                                  ensemble = FALSE) {
+   res <- list()
+   st <- proc.time()
+   message("Performing TWAS weights computation for univariate analysis methods ...")
+@@ -507,6 +508,16 @@ twas_weights_pipeline <- function(X,
        num_threads = cv_threads,
        variants_to_keep = if (length(variants_for_cv) > 0) variants_for_cv else NULL
      )
 +
-+    # Ensemble learning: learn optimal method combination weights via stacked regression
++    # Ensemble learning: learn optimal method combination via stacked regression
 +    if (ensemble && !is.null(res$twas_cv_result$prediction)) {
 +      message("Computing ensemble TWAS weights via stacked regression ...")
 +      res$ensemble <- ensemble_weights(
@@ -24,104 +28,229 @@
 +    }
    }
    res$total_time_elapsed <- proc.time() - st
-
-@@ -514,3 +523,152 @@
+ 
+@@ -671,3 +682,332 @@ twas_multivariate_weights_pipeline <- function(
+   }
    return(res)
  }
-
++
++
 +#' Ensemble TWAS Weights via Stacked Regression
 +#'
-+#' Given cross-validated predictions from multiple methods (output of \code{twas_weights_cv})
-+#' and optionally from multiple datasets, learns non-negative combination weights
-+#' (summing to 1) via constrained least squares (stacked regression). Returns ensemble
-+#' weights and per-method performance metrics.
++#' Given cross-validated predictions from multiple TWAS weight methods, learns
++#' non-negative combination coefficients (summing to 1) via constrained least
++#' squares. Returns ensemble weights and per-method performance metrics.
++#'
++#' This implements the stacked regression approach of SR-TWAS (Dai et al.,
++#' Nature Communications, 2024, \doi{10.1038/s41467-024-50983-w}). The ensemble
++#' provides a principled way to combine predictions from many TWAS weight
++#' methods without requiring the user to pick one method a priori or pay a
++#' multiple-testing penalty for running several.
 +#'
 +#' For single-dataset usage, pass one \code{twas_weights_cv()} result directly.
-+#' For multi-dataset ensemble (e.g., combining CUMC1 + MIT cell types), pass a list
-+#' of \code{twas_weights_cv()} results along with a list of observed Y vectors.
++#' For multi-dataset ensemble (e.g., combining cell types or reference panels
++#' such as CUMC1 + MIT), pass a list of \code{twas_weights_cv()} results along
++#' with a list of observed Y vectors — this learns a single joint set of
++#' coefficients.
 +#'
-+#' @param cv_results Output of \code{twas_weights_cv()}, containing \code{$prediction}
-+#'   (named list of method -> matrix with keys like \code{"susie_predicted"}) and
-+#'   \code{$performance}. For multi-dataset: a list of such objects.
-+#' @param Y Observed outcome vector or matrix. For multi-dataset: a list of vectors/matrices.
-+#' @param twas_weight_list Optional named list of weight matrices from \code{twas_weights()},
-+#'   with keys like \code{"susie_weights"}. Used to construct the final ensemble weight vector.
-+#'   For multi-dataset: a list of such lists (uses the first dataset's weights as base).
-+#' @param context_index Integer, which column of Y to use (default 1, for univariate).
++#' @param cv_results Output of \code{\link{twas_weights_cv}}, with \code{$prediction}
++#'   (named list of method -> out-of-fold prediction matrix, keys like
++#'   \code{"susie_predicted"}). For multi-dataset: a list of such objects.
++#' @param Y Observed outcome vector or matrix (samples x contexts). For
++#'   multi-dataset: a list of vectors/matrices, one per dataset.
++#' @param twas_weight_list Optional named list of weight matrices from
++#'   \code{\link{twas_weights}}, with keys like \code{"susie_weights"}. Used to
++#'   construct the final combined TWAS weight vector. For multi-dataset: a list
++#'   of such lists (the first is used as the weight template).
++#' @param context_index Integer indicating which column of Y to use when Y is a
++#'   matrix. Default is 1 (univariate).
 +#'
-+#' @return A list with:
++#' @return A list with components:
 +#' \describe{
-+#'   \item{method_coef}{Named numeric vector of combination coefficients (zeta_k),
-+#'     non-negative and summing to 1.}
-+#'   \item{ensemble_twas_weights}{Final combined weight vector (or NULL if
-+#'     \code{twas_weight_list} not provided).}
-+#'   \item{method_performance}{Named numeric vector of per-method R-squared from CV.}
-+#'   \item{ensemble_performance}{Named vector with \code{corr} and \code{rsq} for
-+#'     the ensemble.}
++#'   \item{method_coef}{Named numeric vector of combination coefficients
++#'     (\eqn{\zeta_k}), non-negative and summing to 1. Names are method
++#'     base names (e.g., \code{"susie"}, \code{"enet"}).}
++#'   \item{ensemble_twas_weights}{Final combined weight vector
++#'     \eqn{w = \sum_k \zeta_k w_k}, or NULL if \code{twas_weight_list}
++#'     is not provided. Returned as a vector for univariate Y, matrix otherwise.}
++#'   \item{method_performance}{Named numeric vector of per-method R-squared
++#'     computed from out-of-fold CV predictions. Preserved so users can still
++#'     report individual method performance.}
++#'   \item{ensemble_performance}{Named numeric vector with \code{corr}
++#'     (Pearson correlation) and \code{rsq} (R-squared) for the ensemble.}
 +#' }
 +#'
 +#' @details
 +#' The stacked regression solves:
-+#' \deqn{\min_{\zeta} \|y - P\zeta\|^2 \quad s.t. \quad \zeta \geq 0, \sum \zeta = 1}
-+#' where P is the n x K matrix of out-of-fold predictions from K methods.
-+#' This follows the SR-TWAS approach (Dai et al., Nature Communications, 2024).
++#' \deqn{\min_{\zeta} \|y - P\zeta\|^2 \quad \text{s.t.} \quad \zeta_k \geq 0,\ \sum_k \zeta_k = 1}
++#' where P is the \eqn{n \times K} matrix of out-of-fold predictions from K
++#' methods. The constrained quadratic program is solved via
++#' \code{quadprog::solve.QP}. If the QP solver fails (e.g., due to numerical
++#' issues with highly collinear predictions), the function falls back to equal
++#' weights with a message.
++#'
++#' Methods whose CV predictions have zero variance (e.g., when all weights are
++#' zero) are excluded from the optimization and assigned \eqn{\zeta_k = 0}.
++#'
++#' @seealso \code{\link{twas_weights_cv}}, \code{\link{twas_weights}},
++#'   \code{\link{twas_weights_pipeline}}
++#'
++#' @examples
++#' \dontrun{
++#' # After running twas_weights_pipeline with CV:
++#' res <- twas_weights_pipeline(X, y, cv_folds = 5, weight_methods = methods)
++#'
++#' ens <- ensemble_weights(
++#'   cv_results = res$twas_cv_result,
++#'   Y = y,
++#'   twas_weight_list = res$twas_weights
++#' )
++#' ens$method_coef           # combination weights, sum to 1
++#' ens$ensemble_performance  # ensemble R-squared
++#'
++#' # Multi-dataset ensemble (e.g., CUMC1 + MIT cell types):
++#' ens_multi <- ensemble_weights(
++#'   cv_results = list(res_cumc$twas_cv_result, res_mit$twas_cv_result),
++#'   Y = list(y_cumc, y_mit),
++#'   twas_weight_list = list(res_cumc$twas_weights, res_mit$twas_weights)
++#' )
++#' }
 +#'
 +#' @export
 +ensemble_weights <- function(cv_results, Y, twas_weight_list = NULL,
-+                              context_index = 1) {
++                             context_index = 1) {
++  # --- Input validation ---
++  if (is.null(cv_results)) {
++    stop("'cv_results' is required.")
++  }
++  if (is.null(Y)) {
++    stop("'Y' is required.")
++  }
++  if (!is.numeric(context_index) || length(context_index) != 1 || context_index < 1) {
++    stop("'context_index' must be a positive integer scalar.")
++  }
++
++  # --- Normalize single vs multi-dataset input ---
++  # Single dataset: cv_results has $prediction directly (is a twas_weights_cv() output).
++  # Multi-dataset: cv_results is a list of such outputs.
 +  is_single <- !is.null(cv_results$prediction)
 +  if (is_single) {
 +    cv_results <- list(cv_results)
 +    Y <- list(Y)
 +    if (!is.null(twas_weight_list)) twas_weight_list <- list(twas_weight_list)
++  } else {
++    # Multi-dataset: validate list consistency
++    if (!is.list(cv_results) || length(cv_results) == 0) {
++      stop("For multi-dataset ensemble, 'cv_results' must be a non-empty list of ",
++           "twas_weights_cv() outputs.")
++    }
++    if (!is.list(Y) || length(Y) != length(cv_results)) {
++      stop("'Y' must be a list of the same length as 'cv_results' for ",
++           "multi-dataset ensemble.")
++    }
++    if (!is.null(twas_weight_list)) {
++      if (!is.list(twas_weight_list) || length(twas_weight_list) != length(cv_results)) {
++        stop("'twas_weight_list' must be a list of the same length as 'cv_results'.")
++      }
++    }
++    for (d in seq_along(cv_results)) {
++      if (is.null(cv_results[[d]]$prediction)) {
++        stop("cv_results[[", d, "]] does not contain '$prediction'. ",
++             "Expected a twas_weights_cv() output.")
++      }
++    }
 +  }
 +
++  # --- Extract and validate method names ---
 +  pred_names <- names(cv_results[[1]]$prediction)
++  if (is.null(pred_names) || any(pred_names == "")) {
++    stop("cv_results$prediction must be a named list (output of twas_weights_cv).")
++  }
 +  base_names <- gsub("_predicted$", "", pred_names)
 +  K <- length(base_names)
 +
 +  if (K < 2) {
-+    stop("Ensemble learning requires at least 2 methods. Found: ", K)
++    stop("Ensemble learning requires at least 2 methods. Found: ", K, ".")
 +  }
 +
++  # Consistency: all datasets must report the same methods in the same order
++  for (d in seq_along(cv_results)) {
++    if (!identical(names(cv_results[[d]]$prediction), pred_names)) {
++      stop("All cv_results must have the same method names (in $prediction) ",
++           "in the same order. Dataset 1 has: ", paste(pred_names, collapse = ", "),
++           "; dataset ", d, " has: ",
++           paste(names(cv_results[[d]]$prediction), collapse = ", "))
++    }
++  }
++
++  # --- Build stacked prediction matrix P and observed y vector ---
 +  pred_list <- list()
 +  y_list <- list()
 +
 +  for (d in seq_along(cv_results)) {
 +    preds_d <- cv_results[[d]]$prediction
-+    y_d <- if (is.matrix(Y[[d]])) Y[[d]][, context_index] else Y[[d]]
++    y_raw <- Y[[d]]
++    y_d <- if (is.matrix(y_raw) || is.data.frame(y_raw)) {
++      if (context_index > ncol(y_raw)) {
++        stop("context_index (", context_index, ") exceeds number of columns in Y[[",
++             d, "]] (", ncol(y_raw), ").")
++      }
++      as.numeric(as.matrix(y_raw)[, context_index])
++    } else {
++      as.numeric(y_raw)
++    }
 +    n_d <- length(y_d)
 +
-+    P_d <- matrix(NA, nrow = n_d, ncol = K)
++    P_d <- matrix(NA_real_, nrow = n_d, ncol = K)
 +    colnames(P_d) <- base_names
 +    for (k in seq_along(pred_names)) {
 +      pred_mat <- preds_d[[pred_names[k]]]
-+      P_d[, k] <- if (is.matrix(pred_mat)) pred_mat[, context_index] else pred_mat
++      p_col <- if (is.matrix(pred_mat)) pred_mat[, context_index] else as.numeric(pred_mat)
++      if (length(p_col) != n_d) {
++        stop("Prediction length for method '", pred_names[k], "' in dataset ", d,
++             " (", length(p_col), ") does not match Y length (", n_d, ").")
++      }
++      P_d[, k] <- p_col
 +    }
 +    pred_list[[d]] <- P_d
 +    y_list[[d]] <- y_d
 +  }
 +
-+  P <- do.call(rbind, pred_list)
-+  y_obs <- unlist(y_list)
++  P <- do.call(rbind, pred_list)   # (n_total x K)
++  y_obs <- unlist(y_list)           # (n_total)
 +
-+  complete <- complete.cases(P, y_obs)
++  # Remove rows with any NA (in P or y)
++  complete <- stats::complete.cases(P, y_obs)
++  n_dropped <- sum(!complete)
++  if (n_dropped > 0) {
++    message("Dropping ", n_dropped, " observation(s) with NA predictions or outcomes.")
++  }
 +  if (sum(complete) < K + 1) {
-+    stop("Too few complete observations (", sum(complete), ") for ", K, " methods.")
++    stop("Too few complete observations (", sum(complete), ") for ", K,
++         " methods. Need at least ", K + 1, ".")
 +  }
 +  P <- P[complete, , drop = FALSE]
 +  y_obs <- y_obs[complete]
 +
-+  method_sds <- apply(P, 2, sd)
-+  valid_methods <- method_sds > 0
-+  if (sum(valid_methods) < 1) {
-+    stop("All methods have zero-variance predictions. Cannot compute ensemble.")
++  # --- Identify methods with non-zero variance predictions ---
++  method_sds <- apply(P, 2, stats::sd)
++  valid_methods <- method_sds > .Machine$double.eps
++  n_valid <- sum(valid_methods)
++
++  if (n_valid < 1) {
++    stop("All methods have zero-variance predictions. Cannot compute ensemble. ",
++         "This typically means all methods returned zero weights — check that ",
++         "the input data has sufficient signal.")
 +  }
 +
-+  if (sum(valid_methods) == 1) {
-+    zeta <- ifelse(valid_methods, 1, 0)
++  # --- Solve the constrained QP ---
++  if (n_valid == 1) {
++    # Only one method has signal: assign it full weight
++    zeta <- rep(0, K)
++    zeta[valid_methods] <- 1
 +    names(zeta) <- base_names
-+    message("Only one method has non-zero variance predictions. Assigning it full weight.")
++    message("Only one method ('", base_names[valid_methods],
++            "') has non-zero variance predictions. Assigning it full weight.")
 +  } else {
 +    if (!requireNamespace("quadprog", quietly = TRUE)) {
 +      stop("Package 'quadprog' is required for ensemble_weights. ",
@@ -133,15 +262,19 @@
 +
 +    Dmat <- crossprod(P_valid)
 +    dvec <- as.vector(crossprod(P_valid, y_obs))
-+    Dmat <- Dmat + 1e-8 * diag(K_valid)
++    # Ridge term for numerical stability (small relative to trace)
++    Dmat <- Dmat + 1e-8 * mean(diag(Dmat)) * diag(K_valid)
 +
++    # Constraint matrix: first constraint is equality (sum = 1), then K_valid
++    # non-negativity constraints.
 +    Amat <- cbind(rep(1, K_valid), diag(K_valid))
 +    bvec <- c(1, rep(0, K_valid))
 +
 +    qp_sol <- tryCatch(
 +      quadprog::solve.QP(Dmat = Dmat, dvec = dvec, Amat = Amat, bvec = bvec, meq = 1),
 +      error = function(e) {
-+        message("QP solver failed: ", e$message, ". Falling back to equal weights.")
++        warning("QP solver failed: ", conditionMessage(e),
++                ". Falling back to equal weights among valid methods.")
 +        NULL
 +      }
 +    )
@@ -149,8 +282,15 @@
 +    if (is.null(qp_sol)) {
 +      zeta_valid <- rep(1 / K_valid, K_valid)
 +    } else {
++      # Numerical cleanup: clamp to non-negative and renormalize
 +      zeta_valid <- pmax(qp_sol$solution, 0)
-+      zeta_valid <- zeta_valid / sum(zeta_valid)
++      zeta_sum <- sum(zeta_valid)
++      if (zeta_sum <= 0) {
++        warning("QP returned all-zero solution. Falling back to equal weights.")
++        zeta_valid <- rep(1 / K_valid, K_valid)
++      } else {
++        zeta_valid <- zeta_valid / zeta_sum
++      }
 +    }
 +
 +    zeta <- rep(0, K)
@@ -158,47 +298,368 @@
 +    names(zeta) <- base_names
 +  }
 +
-+  ensemble_pred <- P %*% zeta
-+  ensemble_corr <- if (sd(ensemble_pred) > 0) cor(y_obs, ensemble_pred) else NA
-+  ensemble_rsq <- if (!is.na(ensemble_corr)) ensemble_corr^2 else NA
++  # --- Performance metrics ---
++  ensemble_pred <- as.numeric(P %*% zeta)
++  ensemble_corr <- if (stats::sd(ensemble_pred) > 0) {
++    stats::cor(y_obs, ensemble_pred)
++  } else NA_real_
++  ensemble_rsq <- if (!is.na(ensemble_corr)) ensemble_corr^2 else NA_real_
 +
-+  method_rsq <- setNames(sapply(1:K, function(k) {
-+    if (sd(P[, k]) > 0) cor(y_obs, P[, k])^2 else NA
-+  }), base_names)
++  method_rsq <- setNames(vapply(seq_len(K), function(k) {
++    if (method_sds[k] > 0) stats::cor(y_obs, P[, k])^2 else NA_real_
++  }, numeric(1)), base_names)
 +
++  # --- Build ensemble TWAS weight vector (uses first dataset's weights) ---
 +  ensemble_twas_wt <- NULL
 +  if (!is.null(twas_weight_list)) {
 +    wt_list <- twas_weight_list[[1]]
-+    wt_keys <- paste0(base_names, "_weights")
-+    matched <- wt_keys %in% names(wt_list)
-+
-+    if (any(matched)) {
-+      first_wt <- wt_list[[which(matched)[1]]]
-+      p <- nrow(first_wt)
-+      n_contexts <- ncol(first_wt)
-+
-+      ensemble_twas_wt <- matrix(0, nrow = p, ncol = n_contexts)
-+      rownames(ensemble_twas_wt) <- rownames(first_wt)
-+      colnames(ensemble_twas_wt) <- colnames(first_wt)
-+
-+      for (i in which(matched)) {
-+        w_mat <- wt_list[[wt_keys[i]]]
-+        ensemble_twas_wt <- ensemble_twas_wt + zeta[i] * w_mat
-+      }
-+
-+      if (n_contexts == 1) {
-+        ensemble_twas_wt <- ensemble_twas_wt[, 1]
-+      }
++    if (!is.list(wt_list) || length(wt_list) == 0) {
++      warning("twas_weight_list[[1]] is empty or not a list; skipping weight combination.")
 +    } else {
-+      warning("No matching weight keys found in twas_weight_list. ",
-+              "Expected keys like: ", paste(wt_keys[1:min(3, K)], collapse = ", "))
++      wt_keys <- paste0(base_names, "_weights")
++      matched <- wt_keys %in% names(wt_list)
++
++      if (any(matched)) {
++        first_wt <- wt_list[[wt_keys[which(matched)[1]]]]
++        if (!is.matrix(first_wt)) first_wt <- matrix(first_wt, ncol = 1)
++        p <- nrow(first_wt)
++        n_contexts <- ncol(first_wt)
++
++        ensemble_twas_wt <- matrix(0, nrow = p, ncol = n_contexts)
++        rownames(ensemble_twas_wt) <- rownames(first_wt)
++        colnames(ensemble_twas_wt) <- colnames(first_wt)
++
++        for (i in which(matched)) {
++          w_mat <- wt_list[[wt_keys[i]]]
++          if (!is.matrix(w_mat)) w_mat <- matrix(w_mat, ncol = 1)
++          if (!identical(dim(w_mat), dim(ensemble_twas_wt))) {
++            warning("Weight matrix for '", wt_keys[i],
++                    "' has inconsistent dimensions; skipping.")
++            next
++          }
++          ensemble_twas_wt <- ensemble_twas_wt + zeta[i] * w_mat
++        }
++
++        # For univariate case, return as vector
++        if (n_contexts == 1) {
++          ensemble_twas_wt <- setNames(
++            as.numeric(ensemble_twas_wt),
++            rownames(ensemble_twas_wt)
++          )
++        }
++      } else {
++        warning("No matching weight keys found in twas_weight_list. ",
++                "Expected keys like: ",
++                paste(wt_keys[seq_len(min(3, K))], collapse = ", "))
++      }
 +    }
 +  }
 +
-+  return(list(
++  list(
 +    method_coef = zeta,
 +    ensemble_twas_weights = ensemble_twas_wt,
 +    method_performance = method_rsq,
 +    ensemble_performance = c(corr = ensemble_corr, rsq = ensemble_rsq)
-+  ))
++  )
 +}
+diff --git a/tests/testthat/test_ensemble_weights.R b/tests/testthat/test_ensemble_weights.R
+new file mode 100644
+index 0000000..2b043f8
+--- /dev/null
++++ b/tests/testthat/test_ensemble_weights.R
+@@ -0,0 +1,295 @@
++context("ensemble_weights")
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++# Build a synthetic twas_weights_cv() output with K methods. Each method's
++# prediction is a convex combination of the truth + noise, letting us control
++# per-method accuracy. Returns a list shaped exactly like twas_weights_cv()'s
++# output (with $prediction, $performance, $sample_partition).
++make_cv_result <- function(n = 100, K = 4, seed = 1, method_quality = NULL) {
++  set.seed(seed)
++  y <- rnorm(n)
++  sample_names <- paste0("sample_", seq_len(n))
++
++  if (is.null(method_quality)) {
++    # Methods with decreasing quality (noise amounts)
++    method_quality <- seq(0.1, 0.9, length.out = K)
++  }
++  stopifnot(length(method_quality) == K)
++
++  method_names <- paste0("method", seq_len(K))
++  pred_names <- paste0(method_names, "_predicted")
++
++  prediction <- setNames(lapply(seq_len(K), function(k) {
++    noise_sd <- method_quality[k]
++    pred <- y + rnorm(n, sd = noise_sd)
++    mat <- matrix(pred, ncol = 1)
++    rownames(mat) <- sample_names
++    colnames(mat) <- "outcome_1"
++    mat
++  }), pred_names)
++
++  # Dummy performance (not used by ensemble_weights)
++  performance <- setNames(lapply(seq_len(K), function(k) {
++    m <- matrix(NA, nrow = 1, ncol = 6)
++    colnames(m) <- c("corr", "rsq", "adj_rsq", "pval", "RMSE", "MAE")
++    m
++  }), paste0(method_names, "_performance"))
++
++  list(
++    sample_partition = data.frame(Sample = sample_names,
++                                   Fold = rep(1:5, length.out = n),
++                                   stringsAsFactors = FALSE),
++    prediction = prediction,
++    performance = performance,
++    time_elapsed = 0,
++    .y = y,
++    .method_names = method_names
++  )
++}
++
++# Build synthetic twas_weights() output
++make_weight_list <- function(p = 20, method_names, seed = 2) {
++  set.seed(seed)
++  setNames(lapply(method_names, function(m) {
++    w <- matrix(rnorm(p), ncol = 1)
++    rownames(w) <- paste0("var_", seq_len(p))
++    colnames(w) <- "outcome_1"
++    w
++  }), paste0(method_names, "_weights"))
++}
++
++# ===========================================================================
++#  Input validation
++# ===========================================================================
++
++test_that("ensemble_weights: NULL cv_results errors", {
++  expect_error(ensemble_weights(NULL, Y = rnorm(10)), "cv_results")
++})
++
++test_that("ensemble_weights: NULL Y errors", {
++  cv <- make_cv_result(n = 20, K = 3)
++  expect_error(ensemble_weights(cv, Y = NULL), "'Y' is required")
++})
++
++test_that("ensemble_weights: single method errors (need >= 2 for ensemble)", {
++  cv <- make_cv_result(n = 20, K = 1)
++  expect_error(ensemble_weights(cv, Y = cv$.y),
++               "at least 2 methods")
++})
++
++test_that("ensemble_weights: invalid context_index errors", {
++  cv <- make_cv_result(n = 20, K = 3)
++  expect_error(ensemble_weights(cv, Y = cv$.y, context_index = 0),
++               "context_index")
++  expect_error(ensemble_weights(cv, Y = cv$.y, context_index = "a"),
++               "context_index")
++})
++
++test_that("ensemble_weights: context_index beyond Y columns errors", {
++  cv <- make_cv_result(n = 20, K = 3)
++  Y_mat <- matrix(cv$.y, ncol = 1)
++  expect_error(ensemble_weights(cv, Y = Y_mat, context_index = 5),
++               "context_index")
++})
++
++test_that("ensemble_weights: multi-dataset with mismatched lengths errors", {
++  cv1 <- make_cv_result(n = 20, K = 3, seed = 1)
++  cv2 <- make_cv_result(n = 20, K = 3, seed = 2)
++  expect_error(ensemble_weights(list(cv1, cv2), Y = list(cv1$.y)),
++               "same length")
++})
++
++test_that("ensemble_weights: multi-dataset with different methods errors", {
++  cv1 <- make_cv_result(n = 20, K = 3, seed = 1)
++  cv2 <- make_cv_result(n = 20, K = 4, seed = 2)
++  expect_error(
++    ensemble_weights(list(cv1, cv2), Y = list(cv1$.y, cv2$.y)),
++    "same method names"
++  )
++})
++
++# ===========================================================================
++#  Core algorithm correctness
++# ===========================================================================
++
++test_that("ensemble_weights: coefficients are non-negative and sum to 1", {
++  cv <- make_cv_result(n = 100, K = 4, seed = 42)
++  res <- ensemble_weights(cv, Y = cv$.y)
++
++  expect_true(all(res$method_coef >= 0))
++  expect_equal(sum(res$method_coef), 1, tolerance = 1e-6)
++})
++
++test_that("ensemble_weights: best method receives the largest coefficient", {
++  # Method 1 is best (lowest noise), method K is worst
++  cv <- make_cv_result(n = 200, K = 4, seed = 7,
++                        method_quality = c(0.1, 0.5, 0.8, 1.2))
++  res <- ensemble_weights(cv, Y = cv$.y)
++
++  expect_equal(names(which.max(res$method_coef)), "method1")
++})
++
++test_that("ensemble_weights: ensemble R^2 >= best single-method R^2 (or close)", {
++  cv <- make_cv_result(n = 300, K = 5, seed = 13)
++  res <- ensemble_weights(cv, Y = cv$.y)
++
++  best_method_r2 <- max(res$method_performance, na.rm = TRUE)
++  ensemble_r2 <- res$ensemble_performance["rsq"]
++
++  # Stacked regression is constrained (sum=1, non-neg), so it can't always
++  # beat the best single method, but should be very close.
++  expect_true(ensemble_r2 >= best_method_r2 - 0.01)
++})
++
++test_that("ensemble_weights: per-method R^2 values are sensible (between 0 and 1)", {
++  cv <- make_cv_result(n = 200, K = 4, seed = 21)
++  res <- ensemble_weights(cv, Y = cv$.y)
++
++  expect_true(all(res$method_performance >= 0, na.rm = TRUE))
++  expect_true(all(res$method_performance <= 1, na.rm = TRUE))
++  expect_equal(length(res$method_performance), 4)
++})
++
++test_that("ensemble_weights: method names are stripped of _predicted suffix", {
++  cv <- make_cv_result(n = 50, K = 3, seed = 1)
++  res <- ensemble_weights(cv, Y = cv$.y)
++
++  expect_equal(names(res$method_coef),
++               c("method1", "method2", "method3"))
++  expect_equal(names(res$method_performance),
++               c("method1", "method2", "method3"))
++})
++
++# ===========================================================================
++#  Zero-variance / edge cases
++# ===========================================================================
++
++test_that("ensemble_weights: zero-variance method gets coefficient 0", {
++  cv <- make_cv_result(n = 100, K = 3, seed = 5)
++  # Force method 2 to have constant predictions
++  cv$prediction$method2_predicted[, 1] <- 0.5
++  res <- ensemble_weights(cv, Y = cv$.y)
++
++  expect_equal(res$method_coef["method2"], c(method2 = 0))
++  expect_equal(sum(res$method_coef), 1, tolerance = 1e-6)
++})
++
++test_that("ensemble_weights: NA predictions in some samples are dropped", {
++  cv <- make_cv_result(n = 100, K = 3, seed = 5)
++  cv$prediction$method1_predicted[1:5, 1] <- NA
++  expect_message(
++    res <- ensemble_weights(cv, Y = cv$.y),
++    "Dropping"
++  )
++  expect_equal(sum(res$method_coef), 1, tolerance = 1e-6)
++})
++
++test_that("ensemble_weights: all zero-variance methods errors", {
++  cv <- make_cv_result(n = 50, K = 2, seed = 5)
++  cv$prediction$method1_predicted[, 1] <- 0
++  cv$prediction$method2_predicted[, 1] <- 0
++  expect_error(ensemble_weights(cv, Y = cv$.y),
++               "zero-variance predictions")
++})
++
++# ===========================================================================
++#  Weight combination
++# ===========================================================================
++
++test_that("ensemble_weights: ensemble_twas_weights is sum of zeta_k * w_k", {
++  cv <- make_cv_result(n = 100, K = 3, seed = 42)
++  wt <- make_weight_list(p = 10, method_names = cv$.method_names)
++
++  res <- ensemble_weights(cv, Y = cv$.y, twas_weight_list = wt)
++
++  expect_false(is.null(res$ensemble_twas_weights))
++
++  # Verify the combination is correct
++  expected <- matrix(0, nrow = 10, ncol = 1)
++  for (k in seq_along(cv$.method_names)) {
++    m <- cv$.method_names[k]
++    expected <- expected + res$method_coef[m] * wt[[paste0(m, "_weights")]]
++  }
++  expect_equal(as.numeric(res$ensemble_twas_weights),
++               as.numeric(expected),
++               tolerance = 1e-10)
++})
++
++test_that("ensemble_weights: NULL twas_weight_list returns NULL ensemble_twas_weights", {
++  cv <- make_cv_result(n = 50, K = 3, seed = 1)
++  res <- ensemble_weights(cv, Y = cv$.y, twas_weight_list = NULL)
++  expect_null(res$ensemble_twas_weights)
++})
++
++test_that("ensemble_weights: weights with no matching keys warns and skips", {
++  cv <- make_cv_result(n = 50, K = 2, seed = 1)
++  wt <- list(unknown_weights = matrix(1, nrow = 10, ncol = 1))
++
++  expect_warning(
++    res <- ensemble_weights(cv, Y = cv$.y, twas_weight_list = wt),
++    "No matching weight keys"
++  )
++  expect_null(res$ensemble_twas_weights)
++})
++
++# ===========================================================================
++#  Multi-dataset ensemble
++# ===========================================================================
++
++test_that("ensemble_weights: multi-dataset combines predictions correctly", {
++  cv1 <- make_cv_result(n = 80, K = 3, seed = 1)
++  cv2 <- make_cv_result(n = 80, K = 3, seed = 2)
++
++  res <- ensemble_weights(
++    cv_results = list(cv1, cv2),
++    Y = list(cv1$.y, cv2$.y)
++  )
++
++  expect_true(all(res$method_coef >= 0))
++  expect_equal(sum(res$method_coef), 1, tolerance = 1e-6)
++  expect_equal(length(res$method_performance), 3)
++})
++
++test_that("ensemble_weights: Y as matrix with context_index works", {
++  cv <- make_cv_result(n = 50, K = 3, seed = 1)
++  Y_mat <- matrix(cv$.y, ncol = 1)
++  colnames(Y_mat) <- "ctx1"
++
++  res <- ensemble_weights(cv, Y = Y_mat, context_index = 1)
++  expect_equal(sum(res$method_coef), 1, tolerance = 1e-6)
++})
++
++# ===========================================================================
++#  End-to-end with twas_weights_cv (integration)
++# ===========================================================================
++
++test_that("ensemble_weights: end-to-end with twas_weights_cv output", {
++  skip_if_not_installed("glmnet")
++
++  set.seed(42)
++  n <- 100
++  p <- 20
++  X <- matrix(rnorm(n * p), nrow = n, ncol = p)
++  colnames(X) <- paste0("var_", seq_len(p))
++  rownames(X) <- paste0("sample_", seq_len(n))
++
++  beta <- c(1.5, -1.0, 0.8, rep(0, p - 3))
++  y <- as.numeric(X %*% beta + rnorm(n, sd = 0.5))
++
++  cv <- suppressMessages(twas_weights_cv(
++    X, y, fold = 3,
++    weight_methods = list(
++      lasso_weights = list(),
++      enet_weights = list()
++    )
++  ))
++
++  res <- ensemble_weights(cv, Y = y)
++
++  expect_equal(sum(res$method_coef), 1, tolerance = 1e-6)
++  expect_true(all(res$method_coef >= 0))
++  expect_equal(names(res$method_coef), c("lasso", "enet"))
++  expect_true(res$ensemble_performance["rsq"] > 0)
++})

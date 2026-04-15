@@ -2,6 +2,15 @@
 
 Minimal extension to [pecotmr](https://github.com/StatFunGen/pecotmr) for learning optimal ensemble combination weights across multiple TWAS prediction methods and datasets.
 
+## Why
+
+pecotmr offers 10+ TWAS weight methods. Each is best for some genetic architectures but worse for others. Currently users face two bad options:
+
+1. **Pick one method** — arbitrary, sub-optimal for most genes
+2. **Run several and test all** — pay a multiple-testing penalty that hurts power
+
+Ensemble learning is a statistically principled answer: produce **one weight vector per gene** by learning the optimal convex combination of methods, and run a single downstream test.
+
 ## What this does
 
 Given TWAS weight predictions from K methods (e.g., SuSiE, LASSO, Elastic Net, mr.ash, BayesR, ...), learn non-negative combination coefficients that sum to 1, maximizing cross-validated prediction R². This follows the [SR-TWAS](https://www.nature.com/articles/s41467-024-50983-w) stacked regression approach.
@@ -16,11 +25,21 @@ Given TWAS weight predictions from K methods (e.g., SuSiE, LASSO, Elastic Net, m
 ## Repository structure
 
 ```
-.claude/skills/twas-ensemble/SKILL.md   # Claude Code skill (/twas-ensemble)
-R/ensemble_weights.R                     # The ensemble_weights() function
-scripts/test_ensemble_twas.R             # Simulation test using simxQTL
-patches/pecotmr_ensemble.patch           # Patch for pecotmr integration
+.claude/skills/twas-ensemble/SKILL.md    # Claude Code skill (/twas-ensemble)
+R/ensemble_weights.R                      # The ensemble_weights() function
+tests/testthat/test_ensemble_weights.R    # Unit tests (30 tests, pecotmr style)
+scripts/test_ensemble_twas.R              # Simulation test using simxQTL
+patches/pecotmr_ensemble.patch            # Patch for pecotmr integration
 ```
+
+## Status
+
+- Patch applies cleanly to `StatFunGen/pecotmr@main`
+- R syntax check: passes
+- Unit tests: 30/30 pass (1 skipped without glmnet)
+- Sanity check (3 scenarios): coefficients non-negative and sum to 1,
+  best method gets most weight, multi-dataset combination verified,
+  weight combination numerically correct
 
 ## Quick start
 

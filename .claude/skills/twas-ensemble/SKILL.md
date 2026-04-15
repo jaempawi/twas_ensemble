@@ -18,6 +18,19 @@ allowed-tools: "Bash(Rscript *) Bash(R *) Read Write Edit Grep"
 Guide the user through computing TWAS weights using 11 methods and learning
 optimal ensemble combination weights via stacked regression (SR-TWAS approach).
 
+## Why ensemble?
+
+pecotmr offers 10+ TWAS weight methods. Each is best in some genetic
+architecture (sparse, oligogenic, polygenic) but worse in others. Without
+ensemble learning, users face two bad options:
+
+1. **Pick one method**: arbitrary choice, sub-optimal for most genes.
+2. **Run several and test all**: pay multiple-testing penalty that kills power.
+
+Ensemble learning solves both: it produces **one weight vector per gene** by
+learning the optimal convex combination of methods, so downstream TWAS runs
+a single test per gene with no method-selection bias.
+
 ## Overview
 
 The workflow has 3 phases:
